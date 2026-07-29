@@ -18,6 +18,8 @@ No external SDK is required — only [`httpx`](https://www.python-httpx.org/), w
 - Automatic message chunking for Webex's per-message character limit
 - Cron / notification delivery support (`deliver=webex`) with a configurable home room, including out-of-process delivery when `hermes cron` runs standalone from the gateway
 - Native file/media attachment upload (images, documents, voice, video) — both live and via standalone cron delivery
+- Native file/media attachment **download**: files a user sends to the bot are fetched and cached locally so the agent can actually read them, not just see that "a file was sent"
+- Every reply threads to the message that triggered it via Webex's native `parentId` reply feature — including every part of a response that gets split across multiple messages — so multi-turn conversations (and busy group spaces) read like a normal threaded chat instead of a flat stream of disconnected messages
 - Rate-limit (429) and auth-failure (401) handling with backoff
 
 ## Installation
@@ -75,6 +77,12 @@ Unlike some chat APIs, Webex has no separate "upload then reference" step — a 
 - **Standalone / cron delivery**: `_standalone_send(media_files=[...])` uploads the first valid file as the initial message's attachment (with `message` as its caption); any additional files are sent as their own follow-up messages.
 
 Webex enforces exactly **one attachment per message** — a second `files` part in the same request gets rejected with HTTP 400 — so multiple attachments always become multiple messages, never a single multi-file message. If a path fails validation, doesn't exist, or exceeds 100MB, the adapter logs a warning and falls back to a plain text message (`⚠️ Couldn't deliver the attachment...`) rather than silently dropping it or leaking the local file path.
+
+**Receiving** a file works the other way around: a Webex message's `files` field is a list of content URLs, not inline bytes — the adapter re-fetches each one with the bot's own Bearer token (Webex requires the same auth to read a file as to read the message referencing it), extracts the real filename from the `Content-Disposition` header, and hands the bytes to Hermes's shared `cache_media_bytes()` helper (the same entry point the bundled Telegram adapter uses), which classifies it as an image/video/audio/document, validates it, and caches it locally where the agent's tools can read it. A message that's *only* a file with no caption text is still dispatched to the agent — earlier versions silently dropped these. Downloads are capped at 20MB (more conservative than the 100MB outbound cap, matching other adapters' default for unsolicited inbound content) and are skipped (not queued/retried) if that's exceeded.
+
+## Conversation threading
+
+Every outbound reply passes `parentId` set to the Webex message that triggered it (the base Hermes gateway already computes this reply anchor generically; this adapter just honors it). Unlike the initial version, **every** chunk of a response that gets split across Webex's per-message character limit threads to the same parent — so a long answer still reads as one connected reply thread under the user's message rather than only its first line being visually linked.
 
 ## Known limitations
 

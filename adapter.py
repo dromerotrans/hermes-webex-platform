@@ -55,6 +55,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -82,6 +83,15 @@ from gateway.platforms.base import (
 #   - exactly one ``files`` part per message — the API returns 400 for more
 #   - capped at 100MB per attachment
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+
+# Inbound attachments a *user* sends to the bot: each entry in a message's
+# ``files`` array is a URL that must be re-fetched with the bot's own Bearer
+# token (Webex requires the same auth to read a file as to read the message
+# that references it). Capped more conservatively than the 100MB outbound
+# limit above — matches the other bundled adapters' conservative default for
+# unsolicited inbound content (e.g. Telegram's 20MB default) rather than
+# Webex's own outbound ceiling.
+MAX_INBOUND_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +401,8 @@ class WebexAdapter(BasePlatformAdapter):
 
     async def _dispatch_message(self, message: Dict[str, Any], room: Dict[str, Any]) -> None:
         text = (message.get("text") or "").strip()
-        if not text:
+        file_urls = message.get("files") or []
+        if not text and not file_urls:
             return
 
         room_id = room["id"]
@@ -413,8 +424,135 @@ class WebexAdapter(BasePlatformAdapter):
             message_id=message.get("id"),
             raw_message=message,
         )
-        logger.debug("[%s] Message in room %s from %s: %s", self.name, room_id, person_email, text[:80])
+
+        if file_urls:
+            await self._cache_incoming_files(file_urls, message_event)
+
+        logger.debug(
+            "[%s] Message in room %s from %s: %s", self.name, room_id, person_email,
+            (message_event.text or "")[:80],
+        )
         await self.handle_message(message_event)
+
+    # -- Inbound attachments ------------------------------------------------
+    #
+    # A Webex message's ``files`` field is a list of content URLs — the
+    # bytes aren't inline, they have to be re-fetched with the bot's own
+    # Bearer token (same auth used for every other Webex API call; Webex
+    # requires it to read a file, not just to read the message that
+    # references it). Downloaded bytes are handed to Hermes's shared
+    # ``cache_media_bytes()`` (the same entry point Telegram/Discord use for
+    # inbound media) so the result lands in the standard local cache dir with
+    # the standard image/video/audio/document classification, sandbox-visible
+    # path translation, and image validation — nothing Webex-specific about
+    # storage or path safety needs reinventing here.
+
+    async def _cache_incoming_files(self, file_urls: List[str], event: MessageEvent) -> None:
+        from gateway.platforms.base import cache_media_bytes
+
+        cached_notes: List[str] = []
+        for file_url in file_urls:
+            try:
+                cached = await self._download_webex_file(file_url)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to download incoming attachment: %s", self.name, exc,
+                    exc_info=True,
+                )
+                continue
+            if cached is None:
+                continue
+
+            data, filename, mime_type = cached
+            try:
+                result = cache_media_bytes(data, filename=filename, mime_type=mime_type)
+            except Exception as exc:
+                logger.warning("[%s] Failed to cache incoming attachment: %s", self.name, exc)
+                continue
+            if result is None:
+                continue
+
+            event.media_urls.append(result.path)
+            event.media_types.append(result.media_type)
+            if len(event.media_urls) == 1:
+                if result.kind == "image":
+                    event.message_type = MessageType.PHOTO
+                elif result.kind == "video":
+                    event.message_type = MessageType.VIDEO
+                elif result.kind == "audio":
+                    event.message_type = MessageType.VOICE
+                else:
+                    event.message_type = MessageType.DOCUMENT
+            cached_notes.append(result.context_note())
+            logger.info("[%s] Cached incoming %s at %s", self.name, result.kind, result.path)
+
+        for note in cached_notes:
+            event.text = f"{event.text}\n\n{note}" if event.text else note
+
+    async def _download_webex_file(self, file_url: str) -> Optional[tuple]:
+        """Download one Webex attachment URL. Returns (bytes, filename, mime) or None."""
+        if not self._http_client:
+            return None
+
+        async with self._http_client.stream("GET", file_url, follow_redirects=True) as resp:
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", "5"))
+                await asyncio.sleep(retry_after)
+                return None
+            if resp.status_code >= 300:
+                logger.warning(
+                    "[%s] Attachment download failed HTTP %d for %s",
+                    self.name, resp.status_code, file_url,
+                )
+                return None
+
+            content_length = resp.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_INBOUND_ATTACHMENT_BYTES:
+                        logger.warning(
+                            "[%s] Incoming attachment exceeds %d bytes, skipping: %s",
+                            self.name, MAX_INBOUND_ATTACHMENT_BYTES, file_url,
+                        )
+                        return None
+                except ValueError:
+                    pass
+
+            data = bytearray()
+            async for chunk in resp.aiter_bytes():
+                data.extend(chunk)
+                if len(data) > MAX_INBOUND_ATTACHMENT_BYTES:
+                    logger.warning(
+                        "[%s] Incoming attachment exceeded %d bytes mid-download, discarding: %s",
+                        self.name, MAX_INBOUND_ATTACHMENT_BYTES, file_url,
+                    )
+                    return None
+
+            content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+            filename = self._filename_from_content_disposition(
+                resp.headers.get("content-disposition", "")
+            )
+            if not filename:
+                guessed_ext = mimetypes.guess_extension(content_type) or ""
+                filename = f"webex-attachment{guessed_ext}"
+
+        return bytes(data), filename, content_type
+
+    @staticmethod
+    def _filename_from_content_disposition(header: str) -> str:
+        if not header:
+            return ""
+        match = re.search(r'filename\*=(?:UTF-8\'\')?"?([^";]+)"?', header, re.IGNORECASE)
+        if not match:
+            match = re.search(r'filename="?([^";]+)"?', header, re.IGNORECASE)
+        if not match:
+            return ""
+        name = match.group(1).strip()
+        # Defense in depth: cache_media_bytes/cache_document_from_bytes already
+        # reject path traversal, but strip any directory component up front so
+        # a hostile Content-Disposition can't even reach that check with a
+        # crafted display name.
+        return os.path.basename(name)
 
     def _prune_seen_messages(self) -> None:
         if len(self._seen_messages) <= DEDUP_MAX_SIZE:
@@ -445,7 +583,12 @@ class WebexAdapter(BasePlatformAdapter):
                 body["markdown"] = chunk
             else:
                 body["text"] = chunk
-            if reply_to and i == 0:
+            if reply_to:
+                # Thread every chunk to the same triggering message (not to
+                # the previous chunk) so a long, split response still reads
+                # as one Webex reply thread under the user's message, rather
+                # than only the first part being visually linked and the
+                # rest trailing off as unthreaded room messages.
                 body["parentId"] = reply_to
 
             try:
