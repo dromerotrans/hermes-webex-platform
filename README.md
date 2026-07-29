@@ -17,6 +17,7 @@ No external SDK is required — only [`httpx`](https://www.python-httpx.org/), w
 - Markdown replies (Webex renders it natively)
 - Automatic message chunking for Webex's per-message character limit
 - Cron / notification delivery support (`deliver=webex`) with a configurable home room, including out-of-process delivery when `hermes cron` runs standalone from the gateway
+- Native file/media attachment upload (images, documents, voice, video) — both live and via standalone cron delivery
 - Rate-limit (429) and auth-failure (401) handling with backoff
 
 ## Installation
@@ -66,9 +67,17 @@ No external SDK is required — only [`httpx`](https://www.python-httpx.org/), w
 - `_standalone_send()` provides out-of-process delivery so `deliver=webex` cron jobs work even when `hermes cron` runs in a separate process from the live gateway (no in-process adapter to reuse).
 - State (per-room last-seen timestamps) is persisted to `$HERMES_HOME/platforms/webex/state.json`. On the very first run (no state file yet), the adapter snapshots current room activity as a baseline instead of replaying pre-existing history — a freshly wired-up bot won't dump replies to months-old messages.
 
+## File / media attachments
+
+Unlike some chat APIs, Webex has no separate "upload then reference" step — a local file is attached directly in the same `multipart/form-data POST /v1/messages` request that sends the message, via a single `files` part. This adapter implements that for both delivery paths:
+
+- **Live gateway**: `send_image_file`, `send_document`, `send_voice`, and `send_video` all route through a shared `_send_local_file()` helper that validates the path with Hermes's `validate_media_delivery_path()` security gate (see `gateway/platforms/base.py`), checks the file exists and is under Webex's 100MB attachment cap, then uploads it with the message as its caption.
+- **Standalone / cron delivery**: `_standalone_send(media_files=[...])` uploads the first valid file as the initial message's attachment (with `message` as its caption); any additional files are sent as their own follow-up messages.
+
+Webex enforces exactly **one attachment per message** — a second `files` part in the same request gets rejected with HTTP 400 — so multiple attachments always become multiple messages, never a single multi-file message. If a path fails validation, doesn't exist, or exceeds 100MB, the adapter logs a warning and falls back to a plain text message (`⚠️ Couldn't deliver the attachment...`) rather than silently dropping it or leaking the local file path.
+
 ## Known limitations
 
-- No file/media upload support yet (`media_files` is accepted by the standalone-send signature for parity but not implemented).
 - No typing indicator — Webex's bot API doesn't expose one.
 - Polling has inherent latency (bounded by `WEBEX_POLL_INTERVAL_SECONDS`) versus a push webhook; this is a deliberate tradeoff for zero inbound exposure.
 

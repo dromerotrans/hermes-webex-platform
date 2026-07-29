@@ -53,6 +53,7 @@ fresh bot shouldn't reply to months of old messages the moment it's wired up.
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import time
 import uuid
@@ -72,7 +73,15 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    validate_media_delivery_path,
 )
+
+# Webex message attachments (developer.webex.com/messaging/docs/basics):
+#   - uploaded via a multipart/form-data POST to /v1/messages instead of
+#     the JSON body used for plain text (JSON only accepts public URLs)
+#   - exactly one ``files`` part per message — the API returns 400 for more
+#   - capped at 100MB per attachment
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +483,161 @@ class WebexAdapter(BasePlatformAdapter):
         """Webex has no typing-indicator API for bots."""
         pass
 
+    # -- Local file / media delivery ---------------------------------------
+    #
+    # Webex has no separate "upload then reference" step like some chat
+    # APIs (e.g. Mattermost) — the file is attached directly in the same
+    # multipart/form-data POST that creates the message. One attachment per
+    # message; larger deliveries (e.g. several generated images) go out as
+    # one message per file, same as the base class's default
+    # ``send_multiple_images`` loop already does.
+
+    async def _send_local_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        """Upload a local file to a Webex room as a message attachment."""
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+
+        safe_path = self.validate_media_delivery_path(file_path)
+        if not safe_path:
+            logger.warning(
+                "[%s] Refusing to upload unsafe local path: %s", self.name, file_path
+            )
+            return await self.send(
+                chat_id=chat_id,
+                content=self._attachment_failure_text(caption, "the attachment"),
+                reply_to=reply_to,
+            )
+
+        path = Path(safe_path)
+        if not path.is_file():
+            logger.warning(
+                "[%s] Local file not found, skipping upload: %s", self.name, safe_path
+            )
+            return await self.send(
+                chat_id=chat_id,
+                content=self._attachment_failure_text(
+                    caption, "the attachment (file not found)"
+                ),
+                reply_to=reply_to,
+            )
+
+        if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+            logger.warning(
+                "[%s] File exceeds Webex's 100MB attachment limit, skipping: %s",
+                self.name, safe_path,
+            )
+            return await self.send(
+                chat_id=chat_id,
+                content=self._attachment_failure_text(
+                    caption, "the attachment (over Webex's 100MB limit)"
+                ),
+                reply_to=reply_to,
+            )
+
+        display_name = file_name or path.name
+        content_type = mimetypes.guess_type(display_name)[0] or "application/octet-stream"
+
+        form_data: Dict[str, str] = {"roomId": chat_id}
+        if caption:
+            form_data["markdown" if self._markdown_enabled else "text"] = caption
+        if reply_to:
+            form_data["parentId"] = reply_to
+
+        try:
+            with path.open("rb") as fh:
+                resp = await self._http_client.post(
+                    "/messages",
+                    data=form_data,
+                    files={"files": (display_name, fh, content_type)},
+                    timeout=60.0,
+                )
+        except httpx.TimeoutException:
+            return SendResult(
+                success=False, error="Timeout uploading file to Webex", retryable=True
+            )
+        except OSError as e:
+            return SendResult(success=False, error=f"Could not read local file: {e}")
+
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", "5"))
+            return SendResult(
+                success=False, error="Rate limited by Webex", retryable=True,
+                retry_after=retry_after,
+            )
+        if resp.status_code >= 300:
+            body_text = resp.text
+            logger.warning(
+                "[%s] File upload failed HTTP %d: %s",
+                self.name, resp.status_code, body_text[:200],
+            )
+            return SendResult(success=False, error=f"HTTP {resp.status_code}: {body_text[:200]}")
+
+        data = resp.json()
+        return SendResult(success=True, message_id=data.get("id") or uuid.uuid4().hex[:12])
+
+    @staticmethod
+    def _attachment_failure_text(caption: Optional[str], what: str) -> str:
+        text = f"⚠️ Couldn't deliver {what}."
+        return f"{caption}\n{text}" if caption else text
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upload a local image file as a native Webex attachment."""
+        return await self._send_local_file(chat_id, image_path, caption, reply_to)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upload a local file as a native Webex attachment."""
+        return await self._send_local_file(chat_id, file_path, caption, reply_to, file_name)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload an audio file as a native Webex attachment.
+
+        Webex bots have no distinct "voice bubble" API — the file is
+        delivered as a regular playable/downloadable attachment.
+        """
+        return await self._send_local_file(chat_id, audio_path, caption, reply_to)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload a video file as a native Webex attachment."""
+        return await self._send_local_file(chat_id, video_path, caption, reply_to)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about a Webex room."""
         if not self._http_client:
@@ -545,9 +709,17 @@ async def _standalone_send(
 
     Used when the gateway runner is not in this process (e.g. ``hermes
     cron`` running standalone). Without this hook, ``deliver=webex`` cron
-    jobs fail with "No live adapter for platform". ``media_files`` is
-    accepted for signature parity only — file upload isn't implemented in
-    this first cut (see module docstring for scope).
+    jobs fail with "No live adapter for platform".
+
+    Webex allows exactly one file attachment per message (see
+    developer.webex.com/messaging/docs/basics — a second ``files`` part
+    gets a 400). When ``media_files`` has more than one entry, the first
+    is attached to the initial message (with ``message`` as its caption)
+    and every remaining file goes out as its own follow-up message.
+
+    ``force_document`` is accepted for signature parity with other
+    standalone senders — Webex has no separate "send as document" mode,
+    every attachment is delivered the same way regardless of type.
     """
     if not HTTPX_AVAILABLE:
         return {"error": "webex standalone send: httpx not installed"}
@@ -566,27 +738,75 @@ async def _standalone_send(
         bool(extra.get("markdown")) if extra.get("markdown") is not None
         else (markdown_env in ("1", "true", "yes") if markdown_env else True)
     )
-
-    body: Dict[str, Any] = {"roomId": room_id}
     text = message[:MAX_MESSAGE_LENGTH]
-    if markdown_enabled:
-        body["markdown"] = text
-    else:
-        body["text"] = text
-    if thread_id:
-        body["parentId"] = thread_id
+
+    def _safe_local_file(raw_path: str) -> Optional[Path]:
+        safe = validate_media_delivery_path(raw_path)
+        if not safe:
+            logger.warning("webex standalone send: refusing unsafe path %s", raw_path)
+            return None
+        path = Path(safe)
+        if not path.is_file():
+            logger.warning("webex standalone send: file not found %s", safe)
+            return None
+        if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+            logger.warning("webex standalone send: file over 100MB, skipping %s", safe)
+            return None
+        return path
+
+    async def _post_with_file(client: "httpx.AsyncClient", path: Path, caption: str) -> Dict[str, Any]:
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        form_data: Dict[str, str] = {"roomId": room_id}
+        if caption:
+            form_data["markdown" if markdown_enabled else "text"] = caption
+        if thread_id:
+            form_data["parentId"] = thread_id
+        with path.open("rb") as fh:
+            return await client.post(
+                "/messages", data=form_data, files={"files": (path.name, fh, content_type)},
+            )
+
+    async def _post_text_only(client: "httpx.AsyncClient", caption: str) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"roomId": room_id}
+        if caption:
+            body["markdown" if markdown_enabled else "text"] = caption
+        if thread_id:
+            body["parentId"] = thread_id
+        return await client.post("/messages", json=body)
 
     try:
         async with httpx.AsyncClient(
-            base_url=API_BASE, headers={"Authorization": f"Bearer {token}"}, timeout=15.0
+            base_url=API_BASE, headers={"Authorization": f"Bearer {token}"}, timeout=60.0
         ) as client:
-            resp = await client.post("/messages", json=body)
-        if resp.status_code >= 300:
-            return {"error": f"webex HTTP {resp.status_code}: {resp.text[:200]}"}
-        data = resp.json()
+            paths = [p for p in (_safe_local_file(f) for f in (media_files or [])) if p]
+            sent_ids: List[str] = []
+
+            if paths:
+                resp = await _post_with_file(client, paths[0], text)
+            else:
+                resp = await _post_text_only(client, text)
+            if resp.status_code >= 300:
+                return {"error": f"webex HTTP {resp.status_code}: {resp.text[:200]}"}
+            data = resp.json()
+            sent_ids.append(data.get("id") or uuid.uuid4().hex[:12])
+
+            for path in paths[1:]:
+                try:
+                    resp = await _post_with_file(client, path, "")
+                except Exception as e:
+                    logger.warning("webex standalone send: failed uploading %s: %s", path.name, e)
+                    continue
+                if resp.status_code >= 300:
+                    logger.warning(
+                        "webex standalone send: HTTP %d uploading %s: %s",
+                        resp.status_code, path.name, resp.text[:200],
+                    )
+                    continue
+                sent_ids.append(resp.json().get("id") or uuid.uuid4().hex[:12])
+
         return {
             "success": True, "platform": "webex", "chat_id": room_id,
-            "message_id": data.get("id") or uuid.uuid4().hex[:12],
+            "message_id": sent_ids[0] if sent_ids else None,
         }
     except Exception as e:
         return {"error": f"webex standalone send failed: {e}"}
