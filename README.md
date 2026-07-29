@@ -49,7 +49,17 @@ No external SDK is required — only [`httpx`](https://www.python-httpx.org/), w
    WEBEX_ALLOWED_EMAILS=you@example.com,teammate@example.com
    ```
    Without this, `WEBEX_ALLOW_ALL_USERS=true` would let anyone who can message the bot use it — fine for testing, not recommended for anything else.
-6. Restart the gateway for the profile. The adapter self-registers via `register(ctx)` — no core Hermes files need editing.
+6. (Optional) Copy [`rooms.yaml.example`](rooms.yaml.example) to `$HERMES_HOME/platforms/webex/rooms.yaml` if you want per-room threading overrides or a room participation allowlist — see "Per-room configuration" below. Skip this step entirely if the global defaults are fine.
+7. Restart the gateway for the profile. The adapter self-registers via `register(ctx)` — no core Hermes files need editing.
+8. Verify it connected: `hermes -p <profile> gateway status` should show `webex` among the running platforms, and the gateway log (`$HERMES_HOME/logs/gateway.log`) should have a line like `[Webex] Connected as you@yourbot.webex.bot — polling every 5s`.
+
+### Files in this repo
+
+| File | Goes where | Required |
+|---|---|---|
+| `adapter.py`, `__init__.py`, `plugin.yaml` | `$HERMES_HOME/plugins/webex/` | yes |
+| `rooms.yaml.example` | copy to `$HERMES_HOME/platforms/webex/rooms.yaml` (rename, drop `.example`) | no — only if you want per-room config |
+| `LICENSE`, `README.md` | reference only, not needed at runtime | no |
 
 ## Configuration reference
 
