@@ -1,0 +1,30 @@
+# Per-room configuration for the Webex adapter.
+#
+# Optional. Copy this file to $HERMES_HOME/platforms/webex/rooms.yaml and
+# edit it — it's re-read every poll cycle, so changes take effect within
+# one poll interval (WEBEX_POLL_INTERVAL_SECONDS, default 5s). No gateway
+# restart needed. If the file doesn't exist, every room the bot is added
+# to is allowed, and threading follows the global default
+# (WEBEX_THREAD_REPLIES env var, default: true).
+
+# When true, ONLY rooms listed below under `rooms:` with `allowed: true`
+# (or no `allowed` key at all — it defaults to true once a room is listed)
+# may talk to the bot. Every other room — including ones it gets added to
+# later — is silently skipped: the bot advances past their messages
+# without processing or replying to them. Default: false (open — any room
+# the bot is added to may use it, same as before this file existed).
+restrict_to_configured_rooms: false
+
+rooms:
+  # Replace with a real Webex room id (the ``roomId`` field from
+  # ``GET /v1/rooms``, or ``source.chat_id`` in Hermes's own logs).
+  Y2lzY29zcGFyazovL3VzL1JPT00vZXhhbXBsZS1yb29tLWlk:
+    allowed: true
+    # Overrides WEBEX_THREAD_REPLIES just for this room. Omit this key to
+    # follow the global default instead.
+    thread_replies: false
+
+  # A room the bot should never engage in, regardless of
+  # restrict_to_configured_rooms:
+  Y2lzY29zcGFyazovL3VzL1JPT00vYW5vdGhlci1leGFtcGxl:
+    allowed: false

@@ -20,6 +20,7 @@ No external SDK is required — only [`httpx`](https://www.python-httpx.org/), w
 - Native file/media attachment upload (images, documents, voice, video) — both live and via standalone cron delivery
 - Native file/media attachment **download**: files a user sends to the bot are fetched and cached locally so the agent can actually read them, not just see that "a file was sent"
 - Every reply threads to the message that triggered it via Webex's native `parentId` reply feature — including every part of a response that gets split across multiple messages — so multi-turn conversations (and busy group spaces) read like a normal threaded chat instead of a flat stream of disconnected messages
+- Threading is configurable: a global on/off default, plus per-room overrides and a room participation allowlist via an optional `rooms.yaml` — no code changes or gateway restart needed to adjust
 - Rate-limit (429) and auth-failure (401) handling with backoff
 
 ## Installation
@@ -59,6 +60,7 @@ No external SDK is required — only [`httpx`](https://www.python-httpx.org/), w
 | `WEBEX_ALLOW_ALL_USERS` | no | `true`/`false` — allow any user who can message the bot (dev only) |
 | `WEBEX_POLL_INTERVAL_SECONDS` | no | Seconds between polls (default: `5`) |
 | `WEBEX_MARKDOWN` | no | `true`/`false` — send replies as Webex markdown (default: `true`) |
+| `WEBEX_THREAD_REPLIES` | no | `true`/`false` — global default for threading replies via `parentId` (default: `true`). Per-room overrides live in `rooms.yaml`, not here — see "Per-room configuration" below |
 | `WEBEX_HOME_ROOM_ID` | no | Default Webex `roomId` for cron/notification delivery (`deliver=webex`) |
 | `WEBEX_HOME_ROOM_NAME` | no | Human label for the home room |
 
@@ -68,6 +70,7 @@ No external SDK is required — only [`httpx`](https://www.python-httpx.org/), w
 - `_env_enablement()` seeds `PlatformConfig.extra` from env vars before the adapter is constructed, so `hermes gateway status` and `get_connected_platforms()` reflect env-only configuration without needing to stand up an HTTP client.
 - `_standalone_send()` provides out-of-process delivery so `deliver=webex` cron jobs work even when `hermes cron` runs in a separate process from the live gateway (no in-process adapter to reuse).
 - State (per-room last-seen timestamps) is persisted to `$HERMES_HOME/platforms/webex/state.json`. On the very first run (no state file yet), the adapter snapshots current room activity as a baseline instead of replaying pre-existing history — a freshly wired-up bot won't dump replies to months-old messages.
+- Per-room config (`$HERMES_HOME/platforms/webex/rooms.yaml`, optional) is re-read every poll cycle via `_load_rooms_config()` — see "Per-room configuration" below.
 
 ## File / media attachments
 
@@ -83,6 +86,28 @@ Webex enforces exactly **one attachment per message** — a second `files` part 
 ## Conversation threading
 
 Every outbound reply passes `parentId` set to the Webex message that triggered it (the base Hermes gateway already computes this reply anchor generically; this adapter just honors it). Unlike the initial version, **every** chunk of a response that gets split across Webex's per-message character limit threads to the same parent — so a long answer still reads as one connected reply thread under the user's message rather than only its first line being visually linked.
+
+## Per-room configuration
+
+Threading and room participation can both be tuned without touching code or `WEBEX_*` env vars, via an optional `$HERMES_HOME/platforms/webex/rooms.yaml` — copy [`rooms.yaml.example`](rooms.yaml.example) as a starting point. It's re-read every poll cycle (no gateway restart needed):
+
+```yaml
+# Optional. If missing, every room the bot is added to is allowed, and
+# threading follows WEBEX_THREAD_REPLIES (default: true).
+restrict_to_configured_rooms: false   # true = allowlist mode (see below)
+
+rooms:
+  <room_id>:
+    allowed: true          # set false to make the bot ignore this room entirely
+    thread_replies: false  # overrides WEBEX_THREAD_REPLIES just for this room
+```
+
+Two independent controls:
+
+- **Threading override** — set `thread_replies` under a specific room to flip threading on/off just there, regardless of the global `WEBEX_THREAD_REPLIES` default. Useful when one space is a fast-moving group chat where threaded replies feel disconnected, but a 1:1 works better threaded (or vice versa).
+- **Participation allowlist** — set `restrict_to_configured_rooms: true` and the bot only engages with rooms explicitly listed under `rooms:` (with `allowed: true`, the default once a room is listed at all); every other room — including ones it gets added to later — is silently skipped, with its message queue advanced past (not accumulated) so nothing floods in if it's later allowed. Independent of that switch, any individual room can be blocked with `allowed: false`.
+
+Room ids are the `roomId` field from `GET /v1/rooms`, or whatever value shows up as `chat_id` in Hermes's own logs for that room.
 
 ## Known limitations
 

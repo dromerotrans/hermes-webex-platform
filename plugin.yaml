@@ -38,6 +38,10 @@ optional_env:
     description: "Send replies as Webex markdown (true/false, default: true — Webex renders markdown natively)"
     prompt: "Enable markdown formatting? (true/false)"
     password: false
+  - name: WEBEX_THREAD_REPLIES
+    description: "Global default: thread every reply to the message that triggered it via Webex's native parentId reply feature (true/false, default: true). Per-room overrides live in $HERMES_HOME/platforms/webex/rooms.yaml, not here."
+    prompt: "Thread replies by default? (true/false)"
+    password: false
   - name: WEBEX_HOME_ROOM_ID
     description: "Default Webex roomId for cron / notification delivery (deliver=webex)"
     prompt: "Home room id (or empty)"

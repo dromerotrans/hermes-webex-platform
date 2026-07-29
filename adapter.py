@@ -68,6 +68,11 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+# PyYAML is not an extra dependency here — it's already a hard requirement
+# of Hermes core (config.yaml itself is YAML), so it's always present
+# wherever this plugin can run.
+import yaml
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -135,6 +140,62 @@ def _save_state(state: Dict[str, str]) -> None:
         logger.debug("webex: failed to persist state: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Per-room configuration (participation allowlist + threading override)
+#
+# Global defaults live in env vars, same as everything else in this plugin
+# (WEBEX_THREAD_REPLIES). Per-room settings can't be expressed as one env
+# var per room, so they live in a small hand-edited YAML file the adapter
+# re-reads every poll cycle — no gateway restart needed to pick up an edit.
+# Missing/malformed file == today's behavior (every room the bot is added
+# to is allowed; threading follows the global default).
+# ---------------------------------------------------------------------------
+
+def _rooms_config_path() -> Path:
+    home = os.environ.get("HERMES_HOME", "").strip() or os.path.expanduser("~/.hermes")
+    return Path(home) / "platforms" / "webex" / "rooms.yaml"
+
+
+def _load_rooms_config() -> Dict[str, Any]:
+    path = _rooms_config_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as e:
+        logger.warning("[webex] Failed to parse %s, ignoring: %s", path, e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _room_entry(rooms_config: Dict[str, Any], room_id: str) -> Dict[str, Any]:
+    rooms = rooms_config.get("rooms")
+    if not isinstance(rooms, dict):
+        return {}
+    entry = rooms.get(room_id)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _resolve_room_allowed(rooms_config: Dict[str, Any], room_id: str) -> bool:
+    entry = _room_entry(rooms_config, room_id)
+    if "allowed" in entry:
+        return bool(entry["allowed"])
+    if rooms_config.get("restrict_to_configured_rooms"):
+        return False
+    return True
+
+
+def _resolve_room_thread_replies(
+    rooms_config: Dict[str, Any], room_id: str, default: bool
+) -> bool:
+    entry = _room_entry(rooms_config, room_id)
+    if "thread_replies" in entry:
+        return bool(entry["thread_replies"])
+    return default
+
+
 def check_requirements() -> bool:
     """Check whether the Webex adapter is installable and minimally configured."""
     if not HTTPX_AVAILABLE:
@@ -190,6 +251,16 @@ class WebexAdapter(BasePlatformAdapter):
             else os.getenv("WEBEX_MARKDOWN", "true")
         )
         self._markdown_enabled = _bool_env(markdown_raw)
+
+        thread_raw = str(
+            extra.get("thread_replies")
+            if extra.get("thread_replies") is not None
+            else os.getenv("WEBEX_THREAD_REPLIES", "true")
+        )
+        self._thread_replies_default = _bool_env(thread_raw)
+        # Per-room overrides (participation allowlist + threading), re-read
+        # every poll cycle in _poll_once() — see _load_rooms_config().
+        self._rooms_config: Dict[str, Any] = _load_rooms_config()
 
         self._http_client: Optional["httpx.AsyncClient"] = None
         self._poll_task: Optional[asyncio.Task] = None
@@ -330,11 +401,21 @@ class WebexAdapter(BasePlatformAdapter):
         return resp.json().get("items", [])
 
     async def _poll_once(self) -> None:
+        # Re-read every cycle so an edit to rooms.yaml takes effect without
+        # a gateway restart.
+        self._rooms_config = _load_rooms_config()
+
         rooms = await self._list_rooms()
         for room in rooms:
             room_id = room.get("id")
             last_activity = room.get("lastActivity")
             if not room_id or not last_activity:
+                continue
+            if not self._room_allowed(room_id):
+                # Advance the high-water mark without processing anything,
+                # so messages sent while a room is disallowed don't queue up
+                # and flood in the moment it's re-allowed.
+                self._room_last_seen[room_id] = last_activity
                 continue
             known = self._room_last_seen.get(room_id)
             if known is not None and last_activity <= known:
@@ -343,6 +424,14 @@ class WebexAdapter(BasePlatformAdapter):
 
         self._prune_seen_messages()
         _save_state(self._room_last_seen)
+
+    def _room_allowed(self, room_id: str) -> bool:
+        return _resolve_room_allowed(self._rooms_config, room_id)
+
+    def _room_thread_replies(self, room_id: str) -> bool:
+        return _resolve_room_thread_replies(
+            self._rooms_config, room_id, self._thread_replies_default
+        )
 
     async def _poll_room_messages(self, room: Dict[str, Any], since: Optional[str]) -> None:
         room_id = room["id"]
@@ -576,6 +665,7 @@ class WebexAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(content, max_length=self.MAX_MESSAGE_LENGTH)
         last_message_id: Optional[str] = None
         continuation_ids: List[str] = []
+        thread_this_room = reply_to and self._room_thread_replies(chat_id)
 
         for i, chunk in enumerate(chunks):
             body: Dict[str, Any] = {"roomId": chat_id}
@@ -583,12 +673,14 @@ class WebexAdapter(BasePlatformAdapter):
                 body["markdown"] = chunk
             else:
                 body["text"] = chunk
-            if reply_to:
+            if thread_this_room:
                 # Thread every chunk to the same triggering message (not to
                 # the previous chunk) so a long, split response still reads
                 # as one Webex reply thread under the user's message, rather
                 # than only the first part being visually linked and the
-                # rest trailing off as unthreaded room messages.
+                # rest trailing off as unthreaded room messages. Skipped
+                # entirely when this room's config (or the global default)
+                # has threading disabled — see rooms.yaml / WEBEX_THREAD_REPLIES.
                 body["parentId"] = reply_to
 
             try:
@@ -690,7 +782,7 @@ class WebexAdapter(BasePlatformAdapter):
         form_data: Dict[str, str] = {"roomId": chat_id}
         if caption:
             form_data["markdown" if self._markdown_enabled else "text"] = caption
-        if reply_to:
+        if reply_to and self._room_thread_replies(chat_id):
             form_data["parentId"] = reply_to
 
         try:
@@ -829,6 +921,10 @@ def _env_enablement() -> dict | None:
     if markdown:
         seed["markdown"] = markdown in ("1", "true", "yes")
 
+    thread_replies = os.getenv("WEBEX_THREAD_REPLIES", "").strip().lower()
+    if thread_replies:
+        seed["thread_replies"] = thread_replies in ("1", "true", "yes")
+
     home_room = os.getenv("WEBEX_HOME_ROOM_ID", "").strip()
     if home_room:
         seed["home_channel"] = {
@@ -883,6 +979,16 @@ async def _standalone_send(
     )
     text = message[:MAX_MESSAGE_LENGTH]
 
+    thread_env = os.getenv("WEBEX_THREAD_REPLIES", "").strip().lower()
+    thread_default = (
+        bool(extra.get("thread_replies")) if extra.get("thread_replies") is not None
+        else (thread_env in ("1", "true", "yes") if thread_env else True)
+    )
+    # Per-room override still applies even out-of-process — same rooms.yaml
+    # the live gateway reads, loaded fresh since a cron process is short-lived.
+    room_threads = _resolve_room_thread_replies(_load_rooms_config(), room_id, thread_default)
+    effective_thread_id = thread_id if room_threads else None
+
     def _safe_local_file(raw_path: str) -> Optional[Path]:
         safe = validate_media_delivery_path(raw_path)
         if not safe:
@@ -902,8 +1008,8 @@ async def _standalone_send(
         form_data: Dict[str, str] = {"roomId": room_id}
         if caption:
             form_data["markdown" if markdown_enabled else "text"] = caption
-        if thread_id:
-            form_data["parentId"] = thread_id
+        if effective_thread_id:
+            form_data["parentId"] = effective_thread_id
         with path.open("rb") as fh:
             return await client.post(
                 "/messages", data=form_data, files={"files": (path.name, fh, content_type)},
@@ -913,8 +1019,8 @@ async def _standalone_send(
         body: Dict[str, Any] = {"roomId": room_id}
         if caption:
             body["markdown" if markdown_enabled else "text"] = caption
-        if thread_id:
-            body["parentId"] = thread_id
+        if effective_thread_id:
+            body["parentId"] = effective_thread_id
         return await client.post("/messages", json=body)
 
     try:
