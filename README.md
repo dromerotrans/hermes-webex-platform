@@ -1,0 +1,77 @@
+# hermes-webex-platform
+
+A [Webex](https://www.webex.com/) messaging adapter for [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Nous Research). Lets a Hermes profile chat over Cisco Webex — direct 1:1 spaces and group spaces (with @mention etiquette) — with no public webhook or inbound exposure required.
+
+## Why polling instead of a webhook
+
+Webex supports pushing messages to your bot via a registered webhook, but that requires a public HTTPS endpoint, a shared webhook secret, and signature verification. This adapter instead polls the Webex REST API (`GET /v1/rooms` + `GET /v1/messages`) on an interval and replies via `POST /v1/messages`. The gateway process only ever makes outbound calls to `webexapis.com` — nothing new to expose. This mirrors how Hermes's bundled Telegram (long-poll) and Mattermost (websocket) adapters already work.
+
+No external SDK is required — only [`httpx`](https://www.python-httpx.org/), which is already a Hermes dependency.
+
+## Features
+
+- Direct (1:1) and group Webex spaces
+- Group-space etiquette: only responds when @mentioned in a group, matching native Webex bot behavior; every message counts in a 1:1
+- Per-room "last seen" high-water marks persisted to disk, so a gateway restart doesn't replay history or silently skip messages sent while it was down
+- Allowlist enforcement via real, Webex-verified sender identity (`personEmail`), not a spoofable client-side field
+- Markdown replies (Webex renders it natively)
+- Automatic message chunking for Webex's per-message character limit
+- Cron / notification delivery support (`deliver=webex`) with a configurable home room, including out-of-process delivery when `hermes cron` runs standalone from the gateway
+- Rate-limit (429) and auth-failure (401) handling with backoff
+
+## Installation
+
+1. Create a Webex bot at [developer.webex.com](https://developer.webex.com/my-apps) → **Create a New App** → **Bot**. Copy the bot's access token (shown only once).
+2. Copy this plugin into your Hermes profile's plugin directory:
+   ```
+   $HERMES_HOME/plugins/webex/
+   ├── __init__.py
+   ├── adapter.py
+   └── plugin.yaml
+   ```
+   (`$HERMES_HOME` is your Hermes profile's home directory — for the default profile this is usually `~/.hermes`; for a named profile it's that profile's own home.)
+3. Enable the plugin for the profile (`config.yaml`):
+   ```yaml
+   plugins:
+     enabled:
+       - webex-platform
+   ```
+4. Set the required environment variable in that profile's `.env`:
+   ```
+   WEBEX_BOT_TOKEN=your-bot-token-here
+   ```
+5. (Recommended) Restrict who can talk to the bot:
+   ```
+   WEBEX_ALLOWED_EMAILS=you@example.com,teammate@example.com
+   ```
+   Without this, `WEBEX_ALLOW_ALL_USERS=true` would let anyone who can message the bot use it — fine for testing, not recommended for anything else.
+6. Restart the gateway for the profile. The adapter self-registers via `register(ctx)` — no core Hermes files need editing.
+
+## Configuration reference
+
+| Env var | Required | Description |
+|---|---|---|
+| `WEBEX_BOT_TOKEN` | yes | Bot access token from developer.webex.com |
+| `WEBEX_ALLOWED_EMAILS` | no | Comma-separated allowlist of Webex person emails |
+| `WEBEX_ALLOW_ALL_USERS` | no | `true`/`false` — allow any user who can message the bot (dev only) |
+| `WEBEX_POLL_INTERVAL_SECONDS` | no | Seconds between polls (default: `5`) |
+| `WEBEX_MARKDOWN` | no | `true`/`false` — send replies as Webex markdown (default: `true`) |
+| `WEBEX_HOME_ROOM_ID` | no | Default Webex `roomId` for cron/notification delivery (`deliver=webex`) |
+| `WEBEX_HOME_ROOM_NAME` | no | Human label for the home room |
+
+## How it works
+
+- `check_requirements()` / `validate_config()` / `is_connected()` gate whether the adapter is installable, configured, and connected, matching the contract every Hermes platform plugin implements.
+- `_env_enablement()` seeds `PlatformConfig.extra` from env vars before the adapter is constructed, so `hermes gateway status` and `get_connected_platforms()` reflect env-only configuration without needing to stand up an HTTP client.
+- `_standalone_send()` provides out-of-process delivery so `deliver=webex` cron jobs work even when `hermes cron` runs in a separate process from the live gateway (no in-process adapter to reuse).
+- State (per-room last-seen timestamps) is persisted to `$HERMES_HOME/platforms/webex/state.json`. On the very first run (no state file yet), the adapter snapshots current room activity as a baseline instead of replaying pre-existing history — a freshly wired-up bot won't dump replies to months-old messages.
+
+## Known limitations
+
+- No file/media upload support yet (`media_files` is accepted by the standalone-send signature for parity but not implemented).
+- No typing indicator — Webex's bot API doesn't expose one.
+- Polling has inherent latency (bounded by `WEBEX_POLL_INTERVAL_SECONDS`) versus a push webhook; this is a deliberate tradeoff for zero inbound exposure.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

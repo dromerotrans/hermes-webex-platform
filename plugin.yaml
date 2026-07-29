@@ -1,0 +1,48 @@
+name: webex-platform
+label: webex
+kind: platform
+version: 1.0.0
+description: >
+  Webex Messaging adapter for Hermes Agent. Polls the Webex REST API
+  (GET /v1/rooms + GET /v1/messages) for new messages in 1:1 and group
+  spaces the bot belongs to, and replies via POST /v1/messages. No public
+  webhook, no inbound Route/exposure needed — outbound-only polling, the
+  same shape as the bundled long-poll (Telegram) and websocket
+  (Mattermost) adapters. No external SDK required — only httpx, already a
+  Hermes dependency.
+author: diego
+
+# ``requires_env`` and ``optional_env`` entries are surfaced in the
+# ``hermes config`` UI via the platform-plugin env var injector in
+# ``hermes_cli/config.py``.
+requires_env:
+  - name: WEBEX_BOT_TOKEN
+    description: "Webex bot access token (developer.webex.com > My Webex Apps > your bot). Shown only once at bot creation."
+    prompt: "Webex bot access token"
+    password: true
+
+optional_env:
+  - name: WEBEX_ALLOWED_EMAILS
+    description: "Comma-separated Webex person emails allowed to talk to the bot (allowlist, enforced by the gateway)"
+    prompt: "Allowed Webex emails (comma-separated)"
+    password: false
+  - name: WEBEX_ALLOW_ALL_USERS
+    description: "Allow any Webex user who can message the bot (dev only — disables allowlist)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: WEBEX_POLL_INTERVAL_SECONDS
+    description: "Seconds between polls of the Webex REST API (default: 5)"
+    prompt: "Poll interval in seconds (or empty for default)"
+    password: false
+  - name: WEBEX_MARKDOWN
+    description: "Send replies as Webex markdown (true/false, default: true — Webex renders markdown natively)"
+    prompt: "Enable markdown formatting? (true/false)"
+    password: false
+  - name: WEBEX_HOME_ROOM_ID
+    description: "Default Webex roomId for cron / notification delivery (deliver=webex)"
+    prompt: "Home room id (or empty)"
+    password: false
+  - name: WEBEX_HOME_ROOM_NAME
+    description: "Human label for the home room (defaults to the room id)"
+    prompt: "Home room display name (or empty)"
+    password: false
