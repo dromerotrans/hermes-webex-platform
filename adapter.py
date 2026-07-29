@@ -60,6 +60,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 try:
     import httpx
@@ -112,6 +113,14 @@ ROOMS_PAGE_SIZE = 100
 MESSAGES_PAGE_SIZE = 25
 DEDUP_MAX_SIZE = 2000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+
+# Hosts the bot's own Bearer token is ever allowed to be sent to. A
+# message's ``files`` entries are URLs Webex itself generates — but the
+# adapter has no way to *prove* that at runtime, so this is defense in
+# depth against a spoofed/unexpected URL landing in that field (a Webex
+# bug, a future code path that reuses this helper with a less-trusted
+# source, etc.) causing the token to leak to an arbitrary third-party host.
+_ALLOWED_ATTACHMENT_HOSTS = {"webexapis.com", "api.ciscospark.com"}
 
 
 def _bool_env(raw: str) -> bool:
@@ -581,6 +590,14 @@ class WebexAdapter(BasePlatformAdapter):
     async def _download_webex_file(self, file_url: str) -> Optional[tuple]:
         """Download one Webex attachment URL. Returns (bytes, filename, mime) or None."""
         if not self._http_client:
+            return None
+
+        parsed = urlparse(file_url)
+        if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_ATTACHMENT_HOSTS:
+            logger.warning(
+                "[%s] Refusing to send the bot token to an unexpected attachment host: %s",
+                self.name, file_url,
+            )
             return None
 
         async with self._http_client.stream("GET", file_url, follow_redirects=True) as resp:
